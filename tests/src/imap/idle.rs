@@ -115,16 +115,16 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("MESSAGES 1")
-        .assert_contains("UNSEEN 1");
-    imap_check
-        .assert_read(Type::Status, ResponseType::Ok)
-        .await
         .assert_contains("* 1 EXISTS");
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
         .assert_contains("* 1 FETCH (FLAGS () UID 1)");
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("MESSAGES 1")
+        .assert_contains("UNSEEN 1");
 
     // Delete message and expect an update
     imap.send("SELECT Parmeggiano").await;
@@ -151,16 +151,16 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("MESSAGES 0")
-        .assert_contains("UNSEEN 0");
-    imap_check
-        .assert_read(Type::Status, ResponseType::Ok)
-        .await
         .assert_contains("* 1 EXPUNGE");
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
         .assert_contains("* 0 EXISTS");
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("MESSAGES 0")
+        .assert_contains("UNSEEN 0");
 
     // Test SMTP delivery notifications
     let mut lmtp = SmtpConnection::connect().await;
@@ -190,6 +190,45 @@ pub async fn test(
         } else {
             "MESSAGES 11"
         });
+
+    // SMTP delivery to the currently selected mailbox must also wake IDLE.
+    imap_check.send_raw("DONE").await;
+    imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_check.send("SELECT INBOX").await;
+    imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_check.send("IDLE").await;
+    imap_check
+        .assert_read(Type::Continuation, ResponseType::Ok)
+        .await;
+
+    lmtp.ingest(
+        "bill@example.com",
+        &["jdoe@example.com"],
+        concat!(
+            "From: bill@example.com\r\n",
+            "To: jdoe@example.com\r\n",
+            "Subject: IDLE TPS Report\r\n",
+            "X-Spam-Status: No\r\n",
+            "\r\n",
+            "I'm going to need those IDLE notifications ASAP."
+        ),
+    )
+    .await;
+    if is_cluster_test {
+        tokio::time::sleep(SLEEP).await;
+    }
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("EXISTS");
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("FETCH");
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("STATUS \"INBOX\"");
 
     // Stop IDLE mode
     imap_check.send_raw("DONE").await;

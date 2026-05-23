@@ -141,6 +141,73 @@ impl<T: SessionStream> SessionData<T> {
         is_rev2: bool,
         is_utf8: bool,
     ) -> trc::Result<()> {
+        // Fetch selected mailbox changes
+        if check_emails {
+            // Synchronize emails
+            if let Some(mailbox) = mailbox {
+                // Obtain changes since last sync
+                let modseq = mailbox.state.lock().modseq;
+                let new_state = self
+                    .write_mailbox_changes(mailbox, is_qresync)
+                    .await
+                    .caused_by(trc::location!())?;
+                if new_state != modseq {
+                    // Obtain changed messages
+                    let changelog = self
+                        .server
+                        .store()
+                        .changes(
+                            mailbox.id.account_id,
+                            SyncCollection::Email.into(),
+                            Query::Since(modseq),
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+                    let changed_ids = {
+                        let state = mailbox.state.lock();
+                        changelog
+                            .changes
+                            .into_iter()
+                            .filter_map(|change| {
+                                change.try_unwrap_item_id().and_then(|item_id| {
+                                    state
+                                        .id_to_imap
+                                        .get(&((item_id & u32::MAX as u64) as u32))
+                                        .map(|id| id.uid)
+                                })
+                            })
+                            .collect::<AHashSet<_>>()
+                    };
+
+                    if !changed_ids.is_empty() {
+                        let op_start = Instant::now();
+                        self.fetch(
+                            fetch::Arguments {
+                                tag: "".into(),
+                                sequence_set: Sequence::List {
+                                    items: changed_ids
+                                        .into_iter()
+                                        .map(|uid| Sequence::Number { value: uid })
+                                        .collect(),
+                                },
+                                attributes: vec![fetch::Attribute::Flags, fetch::Attribute::Uid],
+                                changed_since: None,
+                                include_vanished: false,
+                            },
+                            mailbox.clone(),
+                            true,
+                            is_qresync,
+                            false,
+                            op_start,
+                        )
+                        .await
+                        .caused_by(trc::location!())
+                        .map(|_| ())?;
+                    }
+                }
+            }
+        }
+
         // Fetch all changed mailboxes
         if check_mailboxes {
             let changes = self
@@ -190,76 +257,6 @@ impl<T: SessionStream> SessionData<T> {
 
             if !buf.is_empty() {
                 self.write_bytes(buf).await?;
-            }
-        }
-
-        // Fetch selected mailbox changes
-        if check_emails {
-            // Synchronize emails
-            if let Some(mailbox) = mailbox {
-                // Obtain changes since last sync
-                let modseq = mailbox.state.lock().modseq;
-                let new_state = self
-                    .write_mailbox_changes(mailbox, is_qresync)
-                    .await
-                    .caused_by(trc::location!())?;
-                if new_state == modseq {
-                    return Ok(());
-                }
-
-                // Obtain changed messages
-                let changelog = self
-                    .server
-                    .store()
-                    .changes(
-                        mailbox.id.account_id,
-                        SyncCollection::Email.into(),
-                        Query::Since(modseq),
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-                let changed_ids = {
-                    let state = mailbox.state.lock();
-                    changelog
-                        .changes
-                        .into_iter()
-                        .filter_map(|change| {
-                            change.try_unwrap_item_id().and_then(|item_id| {
-                                state
-                                    .id_to_imap
-                                    .get(&((item_id & u32::MAX as u64) as u32))
-                                    .map(|id| id.uid)
-                            })
-                        })
-                        .collect::<AHashSet<_>>()
-                };
-
-                if !changed_ids.is_empty() {
-                    let op_start = Instant::now();
-                    return self
-                        .fetch(
-                            fetch::Arguments {
-                                tag: "".into(),
-                                sequence_set: Sequence::List {
-                                    items: changed_ids
-                                        .into_iter()
-                                        .map(|uid| Sequence::Number { value: uid })
-                                        .collect(),
-                                },
-                                attributes: vec![fetch::Attribute::Flags, fetch::Attribute::Uid],
-                                changed_since: None,
-                                include_vanished: false,
-                            },
-                            mailbox.clone(),
-                            true,
-                            is_qresync,
-                            false,
-                            op_start,
-                        )
-                        .await
-                        .caused_by(trc::location!())
-                        .map(|_| ());
-                }
             }
         }
 
