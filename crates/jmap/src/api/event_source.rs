@@ -108,6 +108,11 @@ impl EventSourceHandler for Server {
                 let mut timeout =
                     ping.as_ref().map(|p| p.interval).unwrap_or(LONG_1D_SLUMBER);
 
+                if let Some(ping) = &mut ping {
+                    ping.last_ping = Instant::now();
+                    yield Ok(Frame::data(ping.payload.clone()));
+                }
+
                 loop {
                     match tokio::time::timeout(timeout, push_rx.recv()).await {
                         Ok(Some(notification)) => {
