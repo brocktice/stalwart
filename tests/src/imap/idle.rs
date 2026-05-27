@@ -115,16 +115,13 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("MESSAGES 1")
-        .assert_contains("UNSEEN 1");
+        .assert_contains("* 1 EXISTS")
+        .assert_not_contains("STATUS \"Parmeggiano\"");
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("* 1 EXISTS");
-    imap_check
-        .assert_read(Type::Status, ResponseType::Ok)
-        .await
-        .assert_contains("* 1 FETCH (FLAGS () UID 1)");
+        .assert_contains("* 1 FETCH (FLAGS () UID 1)")
+        .assert_not_contains("STATUS \"Parmeggiano\"");
 
     // Delete message and expect an update
     imap.send("SELECT Parmeggiano").await;
@@ -138,7 +135,8 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("* 1 FETCH (FLAGS (\\Deleted) UID 1)");
+        .assert_contains("* 1 FETCH (FLAGS (\\Deleted) UID 1)")
+        .assert_not_contains("STATUS \"Parmeggiano\"");
 
     imap.send("UID EXPUNGE").await;
     imap.assert_read(Type::Tagged, ResponseType::Ok)
@@ -151,16 +149,13 @@ pub async fn test(
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("MESSAGES 0")
-        .assert_contains("UNSEEN 0");
+        .assert_contains("* 1 EXPUNGE")
+        .assert_not_contains("STATUS \"Parmeggiano\"");
     imap_check
         .assert_read(Type::Status, ResponseType::Ok)
         .await
-        .assert_contains("* 1 EXPUNGE");
-    imap_check
-        .assert_read(Type::Status, ResponseType::Ok)
-        .await
-        .assert_contains("* 0 EXISTS");
+        .assert_contains("* 0 EXISTS")
+        .assert_not_contains("STATUS \"Parmeggiano\"");
 
     // Test SMTP delivery notifications
     let mut lmtp = SmtpConnection::connect().await;
@@ -191,9 +186,50 @@ pub async fn test(
             "MESSAGES 11"
         });
 
-    // Stop IDLE mode
+    // SMTP delivery to the currently selected mailbox must also wake IDLE.
     imap_check.send_raw("DONE").await;
     imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_check.send("SELECT INBOX").await;
+    imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;
+    imap_check.send("IDLE").await;
+    imap_check
+        .assert_read(Type::Continuation, ResponseType::Ok)
+        .await;
+
+    lmtp.ingest(
+        "bill@example.com",
+        &["jdoe@example.com"],
+        concat!(
+            "From: bill@example.com\r\n",
+            "To: jdoe@example.com\r\n",
+            "Subject: IDLE TPS Report\r\n",
+            "X-Spam-Status: No\r\n",
+            "\r\n",
+            "I'm going to need those IDLE notifications ASAP."
+        ),
+    )
+    .await;
+    if is_cluster_test {
+        tokio::time::sleep(SLEEP).await;
+    }
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("EXISTS")
+        .assert_not_contains("STATUS \"INBOX\"");
+    imap_check
+        .assert_read(Type::Status, ResponseType::Ok)
+        .await
+        .assert_contains("FETCH")
+        .assert_not_contains("STATUS \"INBOX\"");
+
+    // Stop IDLE mode. Per RFC 9051 §6.3.11, the server must not have emitted an
+    // unsolicited STATUS for the currently selected mailbox during IDLE.
+    imap_check.send_raw("DONE").await;
+    imap_check
+        .assert_read(Type::Tagged, ResponseType::Ok)
+        .await
+        .assert_not_contains("STATUS \"INBOX\"");
 
     imap_check.send("NOOP").await;
     imap_check.assert_read(Type::Tagged, ResponseType::Ok).await;

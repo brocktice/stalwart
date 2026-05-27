@@ -141,6 +141,73 @@ impl<T: SessionStream> SessionData<T> {
         is_rev2: bool,
         is_utf8: bool,
     ) -> trc::Result<()> {
+        // Fetch selected mailbox changes
+        if check_emails {
+            // Synchronize emails
+            if let Some(mailbox) = mailbox {
+                // Obtain changes since last sync
+                let modseq = mailbox.state.lock().modseq;
+                let new_state = self
+                    .write_mailbox_changes(mailbox, is_qresync)
+                    .await
+                    .caused_by(trc::location!())?;
+                if new_state != modseq {
+                    // Obtain changed messages
+                    let changelog = self
+                        .server
+                        .store()
+                        .changes(
+                            mailbox.id.account_id,
+                            SyncCollection::Email.into(),
+                            Query::Since(modseq),
+                        )
+                        .await
+                        .caused_by(trc::location!())?;
+                    let changed_ids = {
+                        let state = mailbox.state.lock();
+                        changelog
+                            .changes
+                            .into_iter()
+                            .filter_map(|change| {
+                                change.try_unwrap_item_id().and_then(|item_id| {
+                                    state
+                                        .id_to_imap
+                                        .get(&((item_id & u32::MAX as u64) as u32))
+                                        .map(|id| id.uid)
+                                })
+                            })
+                            .collect::<AHashSet<_>>()
+                    };
+
+                    if !changed_ids.is_empty() {
+                        let op_start = Instant::now();
+                        self.fetch(
+                            fetch::Arguments {
+                                tag: "".into(),
+                                sequence_set: Sequence::List {
+                                    items: changed_ids
+                                        .into_iter()
+                                        .map(|uid| Sequence::Number { value: uid })
+                                        .collect(),
+                                },
+                                attributes: vec![fetch::Attribute::Flags, fetch::Attribute::Uid],
+                                changed_since: None,
+                                include_vanished: false,
+                            },
+                            mailbox.clone(),
+                            true,
+                            is_qresync,
+                            false,
+                            op_start,
+                        )
+                        .await
+                        .caused_by(trc::location!())
+                        .map(|_| ())?;
+                    }
+                }
+            }
+        }
+
         // Fetch all changed mailboxes
         if check_mailboxes {
             let changes = self
@@ -170,8 +237,20 @@ impl<T: SessionStream> SessionData<T> {
                 }
                 .serialize(&mut buf, is_rev2, is_utf8, false);
             }
-            // Obtain status of changed mailboxes
+            // Obtain status of changed mailboxes. Skip the currently selected
+            // mailbox: RFC 9051 §6.3.11 notes that STATUS is not recommended on
+            // the currently selected mailbox, and some older clients (notably
+            // some mutt and fetchmail builds) mishandle an unsolicited STATUS
+            // for the selected mailbox during IDLE. Selected-mailbox changes
+            // are already announced above via EXISTS/EXPUNGE/FETCH.
+            let selected_mailbox_id = mailbox.as_ref().map(|mailbox| mailbox.id);
             for mailbox_name in changes.changed {
+                if let Some(selected) = selected_mailbox_id
+                    && self.get_mailbox_by_name(&mailbox_name) == Some(selected)
+                {
+                    continue;
+                }
+
                 if let Ok(status) = self
                     .status(
                         mailbox_name,
@@ -190,76 +269,6 @@ impl<T: SessionStream> SessionData<T> {
 
             if !buf.is_empty() {
                 self.write_bytes(buf).await?;
-            }
-        }
-
-        // Fetch selected mailbox changes
-        if check_emails {
-            // Synchronize emails
-            if let Some(mailbox) = mailbox {
-                // Obtain changes since last sync
-                let modseq = mailbox.state.lock().modseq;
-                let new_state = self
-                    .write_mailbox_changes(mailbox, is_qresync)
-                    .await
-                    .caused_by(trc::location!())?;
-                if new_state == modseq {
-                    return Ok(());
-                }
-
-                // Obtain changed messages
-                let changelog = self
-                    .server
-                    .store()
-                    .changes(
-                        mailbox.id.account_id,
-                        SyncCollection::Email.into(),
-                        Query::Since(modseq),
-                    )
-                    .await
-                    .caused_by(trc::location!())?;
-                let changed_ids = {
-                    let state = mailbox.state.lock();
-                    changelog
-                        .changes
-                        .into_iter()
-                        .filter_map(|change| {
-                            change.try_unwrap_item_id().and_then(|item_id| {
-                                state
-                                    .id_to_imap
-                                    .get(&((item_id & u32::MAX as u64) as u32))
-                                    .map(|id| id.uid)
-                            })
-                        })
-                        .collect::<AHashSet<_>>()
-                };
-
-                if !changed_ids.is_empty() {
-                    let op_start = Instant::now();
-                    return self
-                        .fetch(
-                            fetch::Arguments {
-                                tag: "".into(),
-                                sequence_set: Sequence::List {
-                                    items: changed_ids
-                                        .into_iter()
-                                        .map(|uid| Sequence::Number { value: uid })
-                                        .collect(),
-                                },
-                                attributes: vec![fetch::Attribute::Flags, fetch::Attribute::Uid],
-                                changed_since: None,
-                                include_vanished: false,
-                            },
-                            mailbox.clone(),
-                            true,
-                            is_qresync,
-                            false,
-                            op_start,
-                        )
-                        .await
-                        .caused_by(trc::location!())
-                        .map(|_| ());
-                }
             }
         }
 
